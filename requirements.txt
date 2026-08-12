@@ -1,0 +1,5 @@
+python-can>=4.3
+can-isotp>=2.0
+udsoncan>=1.26
+requests>=2.31
+python-dotenv>=1.0
