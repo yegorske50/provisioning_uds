@@ -63,7 +63,7 @@ def _send_recv(stack, payload: bytes, timeout: float = 2.0) -> bytes:
 def test_full_happy_path(running_simulator):
     server, client = running_simulator
 
-    assert _send_recv(client, bytes([0x10, 0x03])) == bytes([0x50, 0x03, 0x00, 0x32, 0x01, 0xF4])
+    assert _send_recv(client, bytes([0x10, 0x03])) == bytes([0x50, 0x03, 0x01, 0xF4, 0x01, 0xF4])
 
     vin = b"1HGCM82633A123456"[:17]
     assert len(vin) == 17

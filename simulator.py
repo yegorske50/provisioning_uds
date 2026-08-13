@@ -145,10 +145,13 @@ class SimulatedEcuServer:
         if requested not in (SESSION_DEFAULT, SESSION_EXTENDED):
             raise _NegativeResponse(Response.Code.SubFunctionNotSupported)
         self.state.session = requested
-        # 4 dummy P2/P2* timing bytes — udsoncan's client requires exactly 5
-        # bytes of response.data for standard_version >= 2013 (verified
-        # against DiagnosticSessionControl.interpret_response in udsoncan 1.26.1).
-        return bytes([0x50, requested, 0x00, 0x32, 0x01, 0xF4])
+        # P2=500ms, P2*=5000ms. Not just decorative: udsoncan's default config has
+        # use_server_timing=True, so it adopts THESE values as the timeout for every
+        # subsequent request, overriding whatever request_timeout the client was built
+        # with. An unrealistically tight P2 here (e.g. the ISO default of 50ms) makes
+        # udsoncan impose that same 50ms on itself — easily blown by ordinary Python
+        # thread-scheduling jitter, as a real failing test run demonstrated.
+        return bytes([0x50, requested, 0x01, 0xF4, 0x01, 0xF4])
 
     # --- 0x11 ECUReset -------------------------------------------------------
     def _handle_ecu_reset(self, payload: bytes) -> bytes:
