@@ -13,9 +13,7 @@ discussed gets caught in dev instead of only on real hardware.
 
 from __future__ import annotations
 
-import base64
 import logging
-import os
 import time
 from dataclasses import dataclass, field
 
@@ -37,12 +35,19 @@ SID_ROUTINE_CONTROL = 0x31
 SESSION_DEFAULT = 0x01
 SESSION_EXTENDED = 0x03
 
-_FIXED_LENGTH_DIDS = {
-    Did.VIN: 17,
-    Did.DEVICE_ID: 36,
-    Did.VIN_ALIAS: 36,
-}
-_VARIABLE_LENGTH_DIDS = {Did.CSR, Did.DEVICE_CERTIFICATE, Did.ROOT_CA}
+# All six DIDs are opaque bytes — no field gets special treatment for being
+# "commonly a string" (VIN, device_id, vin_alias) vs. "commonly binary" (CSR,
+# device certificate, root CA). The cloud response is the source of truth for
+# content and length; the simulator stores and returns exactly the bytes it
+# receives, same contract as RawBytesCodec in uds/codecs.py, because a real
+# ECU would do the same. No hardcoded length (was 17 for VIN, 36 for
+# device_id/vin_alias) — that assumption is gone; the actual ECU spec never
+# defined one (source doc's DID section is still blank).
+_WRITABLE_DIDS = {Did.VIN, Did.DEVICE_ID, Did.VIN_ALIAS, Did.DEVICE_CERTIFICATE, Did.ROOT_CA}
+# Did.CSR is deliberately excluded — it's server-generated (FR-007) and
+# read-only. Previously a write to it silently no-op'd but still returned a
+# positive response, since nothing in the old if/elif chain matched it; fixed
+# here by making it explicitly rejected rather than silently accepted.
 
 
 class _NegativeResponse(Exception):
@@ -56,22 +61,26 @@ class _NegativeResponse(Exception):
 class SimulatedEcuState:
     session: int = SESSION_DEFAULT
     last_activity: float = field(default_factory=time.monotonic)
-    vin: str | None = None
-    csr: str | None = None
-    device_id: str | None = None
-    vin_alias: str | None = None
-    device_certificate: str | None = None
-    root_ca: str | None = None
+    vin: bytes | None = None
+    csr: bytes | None = None
+    device_id: bytes | None = None
+    vin_alias: bytes | None = None
+    device_certificate: bytes | None = None
+    root_ca: bytes | None = None
     reset_count: int = 0
 
 
-def _fake_pem(label: str, body_bytes: int = 900) -> str:
-    """Not a real CSR/cert — just realistically sized (well over one CAN
-    frame) so ISO-TP multi-frame transfer actually gets exercised in dev,
-    instead of only discovering it works on real hardware."""
-    raw = base64.b64encode(os.urandom(body_bytes)).decode("ascii")
-    wrapped = "\n".join(raw[i:i + 64] for i in range(0, len(raw), 64))
-    return f"-----BEGIN {label}-----\n{wrapped}\n-----END {label}-----\n"
+def _dummy_binary_blob(size: int = 900) -> bytes:
+    """Not shaped like any format — no PEM wrapper, no base64, no ASCII
+    assumption. A real CSR is opaque bytes to this application, so the dummy
+    one is too. Deterministically cycles through every byte value 0x00-0xFF,
+    so tests can assert exact byte-for-byte preservation including the edge
+    values (0x00, 0xFF, 0x80, etc.) that an accidental ASCII round-trip would
+    corrupt or silently hide — this is exactly what _fake_pem's base64 output
+    never exercised, since base64 is always ASCII-safe by construction."""
+    full_range = bytes(range(256))
+    repeated = full_range * (size // 256 + 1)
+    return repeated[:size]
 
 
 class SimulatedEcuServer:
@@ -151,7 +160,7 @@ class SimulatedEcuServer:
         # with. An unrealistically tight P2 here (e.g. the ISO default of 50ms) makes
         # udsoncan impose that same 50ms on itself — easily blown by ordinary Python
         # thread-scheduling jitter, as a real failing test run demonstrated.
-        return bytes([0x50, requested, 0x01, 0xF4, 0x13, 0x88])
+        return bytes([0x50, requested, 0x01, 0xF4, 0x01, 0xF4])
 
     # --- 0x11 ECUReset -------------------------------------------------------
     def _handle_ecu_reset(self, payload: bytes) -> bytes:
@@ -174,7 +183,7 @@ class SimulatedEcuServer:
         if did == Did.CSR:
             if self.state.csr is None:
                 raise _NegativeResponse(Response.Code.ConditionsNotCorrect)  # write VIN first
-            value = self.state.csr.encode("ascii")
+            value = self.state.csr  # already raw bytes — no transformation
         else:
             raise _NegativeResponse(Response.Code.RequestOutOfRange)
 
@@ -186,31 +195,37 @@ class SimulatedEcuServer:
         if len(payload) < 3:
             raise _NegativeResponse(Response.Code.IncorrectMessageLengthOrInvalidFormat)
         did = int.from_bytes(payload[1:3], "big")
-        data = payload[3:]
+        # isotp's stack.recv() hands back a bytearray, not bytes — normalize
+        # here, at the point raw wire data enters application code. This is
+        # NOT a content transformation (the byte values are identical either
+        # way — bytearray == bytes compares equal); it's a container-type fix
+        # so server.state fields actually match the bytes contract.
+        data = bytes(payload[3:])
 
-        if did in _FIXED_LENGTH_DIDS:
-            expected_len = _FIXED_LENGTH_DIDS[did]
-            if len(data) != expected_len:
-                raise _NegativeResponse(Response.Code.IncorrectMessageLengthOrInvalidFormat)
-            value = data.decode("ascii", errors="replace")
-        elif did in _VARIABLE_LENGTH_DIDS:
-            if len(data) == 0:
-                raise _NegativeResponse(Response.Code.IncorrectMessageLengthOrInvalidFormat)
-            value = data.decode("ascii", errors="replace")
-        else:
+        if did not in _WRITABLE_DIDS:
+            # covers both genuinely-unknown DIDs and Did.CSR (read-only) —
+            # same NRC either way, from this service's point of view neither
+            # is a valid write target
             raise _NegativeResponse(Response.Code.RequestOutOfRange)
+        if len(data) == 0:
+            # a zero-byte payload is a degenerate/malformed request regardless
+            # of which DID — this is a protocol-level sanity check, not a
+            # content-format assumption about any particular field
+            raise _NegativeResponse(Response.Code.IncorrectMessageLengthOrInvalidFormat)
 
+        # every writable DID gets the exact bytes received, unchanged — no
+        # decode, no length check, no format assumption for any of them
         if did == Did.VIN:
-            self.state.vin = value
-            self.state.csr = _fake_pem("CERTIFICATE REQUEST")  # FR-007: generated on VIN write
+            self.state.vin = data
+            self.state.csr = _dummy_binary_blob()  # FR-007: generated on VIN write
         elif did == Did.DEVICE_ID:
-            self.state.device_id = value
+            self.state.device_id = data
         elif did == Did.VIN_ALIAS:
-            self.state.vin_alias = value
+            self.state.vin_alias = data
         elif did == Did.DEVICE_CERTIFICATE:
-            self.state.device_certificate = value
+            self.state.device_certificate = data
         elif did == Did.ROOT_CA:
-            self.state.root_ca = value
+            self.state.root_ca = data
 
         return bytes([0x6E]) + payload[1:3]
 

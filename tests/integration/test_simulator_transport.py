@@ -73,7 +73,11 @@ def test_full_happy_path(running_simulator):
     assert csr_resp[:3] == bytes([0x62, 0xF1, 0xA0])
     csr_bytes = csr_resp[3:]
     assert len(csr_bytes) > 7  # proves ISO-TP multi-frame actually carried this
-    assert csr_bytes.startswith(b"-----BEGIN CERTIFICATE REQUEST-----")
+    # raw bytes, no PEM/ASCII shape assumed — exact match against the
+    # simulator's own state, plus explicit presence of the byte values an
+    # ASCII round-trip would have corrupted or crashed on
+    assert csr_bytes == server.state.csr
+    assert 0x00 in csr_bytes and 0xFF in csr_bytes and 0x80 in csr_bytes
 
     device_id = b"a" * 36
     assert _send_recv(client, bytes([0x2E, 0xF1, 0xA1]) + device_id) == bytes([0x6E, 0xF1, 0xA1])
@@ -81,11 +85,15 @@ def test_full_happy_path(running_simulator):
     vin_alias = b"b" * 36
     assert _send_recv(client, bytes([0x2E, 0xF1, 0xA2]) + vin_alias) == bytes([0x6E, 0xF1, 0xA2])
 
-    cert = b"-----BEGIN CERTIFICATE-----\n" + b"x" * 800 + b"\n-----END CERTIFICATE-----\n"
+    # deliberately every byte value 0x00-0xFF, not printable ASCII padding —
+    # 'x'*800 would pass even with a hidden ASCII conversion bug in the way
+    cert = bytes(range(256)) * 4
     assert _send_recv(client, bytes([0x2E, 0xF1, 0xA3]) + cert) == bytes([0x6E, 0xF1, 0xA3])
+    assert server.state.device_certificate == cert  # exact bytes reached the ECU's state
 
-    root_ca = b"-----BEGIN CERTIFICATE-----\n" + b"y" * 800 + b"\n-----END CERTIFICATE-----\n"
+    root_ca = bytes(reversed(range(256))) * 4
     assert _send_recv(client, bytes([0x2E, 0xF1, 0xA4]) + root_ca) == bytes([0x6E, 0xF1, 0xA4])
+    assert server.state.root_ca == root_ca
 
     assert _send_recv(client, bytes([0x31, 0x01, 0x03, 0x01])) == bytes([0x71, 0x01, 0x03, 0x01])
 
@@ -116,3 +124,24 @@ def test_session_times_out_and_resend_10_03_fixes_it(running_simulator):
     _send_recv(client, bytes([0x10, 0x03]))
     resp = _send_recv(client, bytes([0x2E, 0xF1, 0xA1]) + device_id)
     assert resp == bytes([0x6E, 0xF1, 0xA1])  # now it works
+
+
+def test_no_length_assumption_at_wire_level(running_simulator):
+    """Before this change, a non-17-byte VIN write would have been rejected
+    with NRC 0x13 (IncorrectMessageLengthOrInvalidFormat) by the simulator's
+    old _FIXED_LENGTH_ASCII_DIDS check. That check is gone — any non-empty
+    length must now succeed, proven at the raw wire level, not just through
+    EcuUdsClient's Python API."""
+    server, client = running_simulator
+
+    _send_recv(client, bytes([0x10, 0x03]))  # extended session
+
+    short_vin = b"ABC"  # 3 bytes, nowhere near the old 17-byte assumption
+    resp = _send_recv(client, bytes([0x2E, 0xF1, 0x90]) + short_vin)
+    assert resp == bytes([0x6E, 0xF1, 0x90])  # positive response, not NRC 0x13
+    assert server.state.vin == short_vin
+
+    # an empty payload is still rejected — protocol-level sanity check, not
+    # a length assumption about VIN specifically
+    resp = _send_recv(client, bytes([0x2E, 0xF1, 0x90]))
+    assert resp == bytes([0x7F, 0x2E, 0x13])  # IncorrectMessageLengthOrInvalidFormat

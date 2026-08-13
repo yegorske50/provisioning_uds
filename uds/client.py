@@ -35,7 +35,7 @@ from udsoncan.exceptions import (
 from udsoncan.services import DiagnosticSessionControl, ECUReset, RoutineControl
 
 from config import AppConfig, Did, RoutineId
-from uds.codecs import StringCodec
+from uds.codecs import RawBytesCodec
 
 # Operational failures from udsoncan get translated to this — nothing above
 # this class needs to know udsoncan exists, matching every other adapter
@@ -53,12 +53,12 @@ class UdsOperationError(Exception):
 
 
 _DID_CONFIG = {
-    Did.VIN: StringCodec(length=17),
-    Did.CSR: StringCodec(),                  # variable — PEM
-    Did.DEVICE_ID: StringCodec(length=36),
-    Did.VIN_ALIAS: StringCodec(length=36),
-    Did.DEVICE_CERTIFICATE: StringCodec(),   # variable — PEM
-    Did.ROOT_CA: StringCodec(),              # variable — PEM
+    Did.VIN: RawBytesCodec(),                  # opaque bytes — no length/format assumed
+    Did.CSR: RawBytesCodec(),                  # opaque bytes — no format assumed
+    Did.DEVICE_ID: RawBytesCodec(),            # opaque bytes — no length/format assumed
+    Did.VIN_ALIAS: RawBytesCodec(),            # opaque bytes — no length/format assumed
+    Did.DEVICE_CERTIFICATE: RawBytesCodec(),   # opaque bytes — no format assumed
+    Did.ROOT_CA: RawBytesCodec(),              # opaque bytes — no format assumed
 }
 
 
@@ -86,37 +86,46 @@ class EcuUdsClient:
         self._run(self._client.change_session, DiagnosticSessionControl.Session.extendedDiagnosticSession)
 
     # --- FR-mapped operations --------------------------------------------------
-    def write_vin(self, vin: str) -> None:
-        """FR-005..008."""
+    def write_vin(self, vin: bytes) -> None:
+        """FR-005..008. `vin` is opaque bytes — exactly what the caller
+        (eventually the cloud response) provides, no length assumption
+        (was 17 — removed, unsupported by the actual ECU spec, which is
+        still blank on this), no ASCII/format transformation. See
+        uds/codecs.py RawBytesCodec."""
         self._enter_extended_session()
         self._run(self._client.write_data_by_identifier, Did.VIN, vin)
 
-    def read_csr(self) -> str:
-        """FR-009..013."""
+    def read_csr(self) -> bytes:
+        """FR-009..013. Returns opaque bytes exactly as the ECU sent them —
+        no ASCII/PEM/base64 assumption. See uds/codecs.py RawBytesCodec."""
         self._enter_extended_session()
         response = self._run(self._client.read_data_by_identifier, [Did.CSR])
         return response.service_data.values[Did.CSR]
 
-    def write_device_id(self, device_id: str) -> None:
-        """FR-018..021."""
+    def write_device_id(self, device_id: bytes) -> None:
+        """FR-018..021. Opaque bytes, no length assumption (was 36) — same
+        reasoning as write_vin."""
         self._enter_extended_session()
         self._run(self._client.write_data_by_identifier, Did.DEVICE_ID, device_id)
 
-    def write_vin_alias(self, alias: str) -> None:
-        """FR-022..025."""
+    def write_vin_alias(self, alias: bytes) -> None:
+        """FR-022..025. Opaque bytes, no length assumption — same reasoning
+        as write_vin."""
         self._enter_extended_session()
         self._run(self._client.write_data_by_identifier, Did.VIN_ALIAS, alias)
 
-    def write_device_certificate(self, pem: str) -> None:
-        """FR-026..029."""
+    def write_device_certificate(self, data: bytes) -> None:
+        """FR-026..029. `data` is opaque bytes, passed through unchanged —
+        no ASCII/PEM/base64 assumption. See uds/codecs.py RawBytesCodec."""
         self._enter_extended_session()
-        self._run(self._client.write_data_by_identifier, Did.DEVICE_CERTIFICATE, pem)
+        self._run(self._client.write_data_by_identifier, Did.DEVICE_CERTIFICATE, data)
 
-    def write_root_ca(self, pem: str) -> None:
+    def write_root_ca(self, data: bytes) -> None:
         """Not in the FR list explicitly, but the cloud response returns one —
-        see architecture doc Open Question #6."""
+        see architecture doc Open Question #6. `data` is opaque bytes, same as
+        write_device_certificate."""
         self._enter_extended_session()
-        self._run(self._client.write_data_by_identifier, Did.ROOT_CA, pem)
+        self._run(self._client.write_data_by_identifier, Did.ROOT_CA, data)
 
     def restart(self, wait_s: float = 2.0) -> None:
         """FR-030..031. Real hardware drops off the bus briefly after a hard
