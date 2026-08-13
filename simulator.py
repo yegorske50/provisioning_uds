@@ -151,7 +151,7 @@ class SimulatedEcuServer:
         # with. An unrealistically tight P2 here (e.g. the ISO default of 50ms) makes
         # udsoncan impose that same 50ms on itself — easily blown by ordinary Python
         # thread-scheduling jitter, as a real failing test run demonstrated.
-        return bytes([0x50, requested, 0x01, 0xF4, 0x01, 0xF4])
+        return bytes([0x50, requested, 0x01, 0xF4, 0x13, 0x88])
 
     # --- 0x11 ECUReset -------------------------------------------------------
     def _handle_ecu_reset(self, payload: bytes) -> bytes:
