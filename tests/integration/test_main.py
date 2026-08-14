@@ -2,10 +2,19 @@
 tests/integration/test_main.py
 
 Proves main.py's composition root actually wires everything correctly and
-runs end to end — real isotp/simulator on the real load_config("dev") port
-and addressing (not a test-only config), mocked cloud, driven through
-main() itself rather than constructing the pieces by hand like
-test_orchestrator_end_to_end.py does.
+runs end to end — driven through main() itself rather than constructing the
+pieces by hand like test_orchestrator_end_to_end.py does.
+
+Uses PROVISIONING_DEV_CAN_PORT to isolate onto its own port (43204) rather
+than the real dev default (43113). Originally this used the literal dev
+default on purpose, to prove main.py's actual default wiring worked — but
+that meant this test would collide with a manually-run `python simulator.py
+--env dev` on the same machine, since both bind the same udp_multicast
+port/group. That's exactly what happened in practice: crossed responses
+between the test's own simulator and a leftover manual one, surfacing as an
+UnexpectedResponseException that had nothing to do with main.py's logic.
+Isolating the port removes that entire class of collision; addressing,
+cloud config, and everything else still comes from the real load_config("dev").
 """
 from __future__ import annotations
 
@@ -39,13 +48,18 @@ def _mock_cloud_response(vin: str) -> MagicMock:
 
 @pytest.fixture
 def running_dev_simulator(monkeypatch):
-    cfg = load_config("dev")  # the REAL dev config main.py itself will load — not a test-only port
+    # Set before load_config("dev") runs — both this fixture's own call AND
+    # main_module.main()'s internal load_config("dev") call (invoked later,
+    # when the test calls main()) read this from the same process env, so
+    # both land on the isolated port automatically.
+    monkeypatch.setenv("PROVISIONING_DEV_CAN_PORT", "43204")
+    monkeypatch.setenv("PROVISIONING_API_KEY", "dummy-key-for-test")
+
+    cfg = load_config("dev")
     ecu_stack = build_isotp_stack(cfg, role="ecu")
     server = SimulatedEcuServer(ecu_stack)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-
-    monkeypatch.setenv("PROVISIONING_API_KEY", "dummy-key-for-test")
 
     yield server
 

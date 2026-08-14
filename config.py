@@ -86,7 +86,11 @@ def load_config(env: str = "dev") -> AppConfig:
             can_bus=CanBusConfig(
                 interface="udp_multicast",
                 channel="239.0.0.1",
-                port=43113,
+                # Overridable so automated tests can isolate themselves onto
+                # their own port instead of colliding with a manually-run
+                # `python simulator.py --env dev` on the same machine —
+                # unset, this is still 43113, unchanged from before.
+                port=int(os.environ.get("PROVISIONING_DEV_CAN_PORT", "43113")),
             ),
             uds_address=UdsAddressConfig(
                 addressing_mode="normal_11bits",
