@@ -8,19 +8,20 @@ only one concrete EcuUdsClient and one concrete CloudProvisioningClient; the
 Protocols exist so this file doesn't know or care that they exist, and so
 tests run against fakes with no bus and no network.
 
-Two known rough edges, flagged rather than smoothed over:
+One known rough edge, flagged rather than smoothed over:
 
 1. Already-provisioned handling (Open Question #3): that response shape has
    no device_cert/aws_root_ca, so there's nothing to program. run() raises
    rather than guessing what "success" means here — needs a product decision.
 
-2. ER-006 vs ER-007 ambiguity: verify_certificate_integrity() on EcuUdsClient
-   does BOTH "reconnect" (re-enter extended session) and "verify" (routine
-   control) behind one call (see uds/client.py's docstring on why). A failure
-   there could be either FR-032/033 (reconnect) or FR-035..038 (verify) and
-   this file cannot tell which without EcuUdsClient exposing more granular
-   methods. Defaults to ER-006, since a device still booting fails at session
-   entry before ever reaching the routine control — more likely, not certain.
+(Previously a second rough edge existed here: ER-006 vs ER-007 ambiguity,
+since verify_certificate_integrity() did both "reconnect" and "verify"
+behind one call. Resolved by EcuUdsClient.reconnect() being explicit now —
+_restart_and_reconnect() calls it directly and attributes its failures to
+ER-006, so a _verify_integrity() failure is unambiguously ER-007. One small
+residual note, not a rough edge: verify_certificate_integrity() still
+defensively re-enters the session internally too — kept as defense-in-depth,
+see uds/client.py's docstring on that method.)
 """
 from __future__ import annotations
 
@@ -47,6 +48,7 @@ class UdsClientProtocol(Protocol):
     def write_device_certificate(self, data: bytes) -> None: ...
     def write_root_ca(self, data: bytes) -> None: ...
     def restart(self, wait_s: float = 2.0) -> None: ...
+    def reconnect(self) -> None: ...
     def verify_certificate_integrity(self) -> None: ...
 
 
@@ -99,6 +101,15 @@ class ProvisioningOrchestrator:
             return creds
         except ProvisioningError as e:
             self._emit(ProvisioningStage.FAILED, detail=f"{e.er_code}: {e.message}")
+            try:
+                self._uds_client.disconnect()
+            except Exception:
+                # best-effort only — deliberately bare. Verified that
+                # disconnecting a client that never successfully connected
+                # (e.g. an ER-001 failure) raises RuntimeError, not
+                # UdsOperationError, so a narrower catch here would let a
+                # cleanup failure mask the original, more important error.
+                pass
             raise
 
     # --- private steps — one per FR group -------------------------------------
@@ -165,13 +176,17 @@ class ProvisioningOrchestrator:
             raise ProvisioningError("ER-006", ProvisioningStage.FAILED, f"Restart failed: {e}", cause=e) from e
         self._emit(ProvisioningStage.RESTARTING)
 
+        try:
+            self._uds_client.reconnect()
+        except UdsOperationError as e:
+            raise ProvisioningError("ER-006", ProvisioningStage.FAILED, f"Reconnect after restart failed: {e}", cause=e) from e
+        self._emit(ProvisioningStage.RECONNECTED)
+
     def _verify_integrity(self) -> None:
         try:
             self._uds_client.verify_certificate_integrity()
         except UdsOperationError as e:
-            # ER-006 vs ER-007 ambiguity — see module docstring point 2.
-            raise ProvisioningError("ER-006", ProvisioningStage.FAILED, f"Reconnect or integrity check failed: {e}", cause=e) from e
-        self._emit(ProvisioningStage.RECONNECTED)
+            raise ProvisioningError("ER-007", ProvisioningStage.FAILED, f"Integrity verification failed: {e}", cause=e) from e
         self._emit(ProvisioningStage.INTEGRITY_VERIFIED)
 
     def _disconnect(self) -> None:

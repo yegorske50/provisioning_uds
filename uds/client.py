@@ -12,10 +12,13 @@ in the whole flow (the cloud API call) without needing a thread at all, and
 it's verified for real in tests/integration/test_simulator_transport.py
 (session-timeout test) and tests/integration/test_ecu_client.py.
 
-One consequence worth knowing: because every method already re-enters the
-session defensively, "reconnect after restart" (FR-032/033) doesn't need its
-own method — the next call after restart() just re-enters the session as
-normal. See ProvisioningOrchestrator._restart_and_reconnect() when that's built.
+One consequence worth knowing: session re-entry being defensive by default is
+what made "reconnect after restart" (FR-032/033) *able* to be implicit at
+first — but that implicitness turned out to blur ER-006 (restart/reconnect)
+from ER-007 (verify) at the orchestrator level, since verify_certificate_
+integrity()'s own defensive re-entry was doing double duty as the reconnect.
+reconnect() now exists as an explicit method specifically so the orchestrator
+can attribute failures correctly — see ProvisioningOrchestrator._restart_and_reconnect().
 """
 
 from __future__ import annotations
@@ -129,19 +132,35 @@ class EcuUdsClient:
 
     def restart(self, wait_s: float = 2.0) -> None:
         """FR-030..031. Real hardware drops off the bus briefly after a hard
-        reset — wait_s covers that gap. The next call after this one
-        re-enters extended session defensively, which is FR-032/033's
-        "reconnect" — no separate method needed."""
+        reset — wait_s covers that gap. Reconnection is a separate explicit
+        call now (reconnect()), not handled implicitly by the next method's
+        defensive session re-entry — see reconnect()'s docstring for why."""
         self._enter_extended_session()
         self._run(self._client.ecu_reset, ECUReset.ResetType.hardReset)
         time.sleep(wait_s)
+
+    def reconnect(self) -> None:
+        """FR-032..033. Explicit reconnect after restart() — separated out
+        specifically so a failure here can be attributed to ER-006 and not
+        conflated with ER-007 (verify_certificate_integrity's failure code).
+        Previously this was implicit (every method re-entered session
+        defensively, so "the next call after restart" was the de facto
+        reconnect) — that shortcut is exactly what made ER-006 vs ER-007
+        ambiguous at the orchestrator level. See orchestration/workflow.py."""
+        self._enter_extended_session()
 
     def verify_certificate_integrity(self) -> None:
         """FR-035..038. Raises UdsOperationError on failure — doesn't return
         a bool, because udsoncan's default config already raises
         NegativeResponseException on a negative response, so a returned
         False would never actually happen; a bool return here would be a
-        contract that lies about when it can be false."""
+        contract that lies about when it can be false.
+
+        Still re-enters extended session defensively here too, even though
+        the orchestrator now calls reconnect() first — kept deliberately as
+        defense-in-depth (same reasoning as the original TesterPresent fix),
+        so this method stays safe to call on its own rather than silently
+        depending on a caller having reconnected first."""
         self._enter_extended_session()
         self._run(
             self._client.routine_control,

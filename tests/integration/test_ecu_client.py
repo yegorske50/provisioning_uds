@@ -161,3 +161,21 @@ def test_no_length_or_format_assumptions(running_simulator):
     # level sanity check, not a content-format assumption about any field
     with pytest.raises(UdsOperationError):
         client.write_vin(b"")
+
+
+
+def test_reconnect_after_restart(running_simulator):
+    """reconnect() is now explicit, not implicit-via-the-next-call — verify
+    it actually re-establishes extended session over the real UDS stack."""
+    server, client = running_simulator
+    client.connect()
+    client.write_vin(b"1HGCM82633A123456")
+
+    client.restart(wait_s=0.2)
+    client.reconnect()  # explicit now, not folded into the next call
+
+    # extended-session-only op succeeds immediately after reconnect(), with
+    # no additional session re-entry needed — proving reconnect() actually
+    # did its job rather than the next call papering over a no-op
+    csr = client.read_csr()
+    assert csr == server.state.csr

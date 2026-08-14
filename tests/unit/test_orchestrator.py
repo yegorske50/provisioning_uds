@@ -43,6 +43,7 @@ class _FakeUdsClient:
     def write_device_certificate(self, data: bytes) -> None: self._record("write_device_certificate", data)
     def write_root_ca(self, data: bytes) -> None: self._record("write_root_ca", data)
     def restart(self, wait_s: float = 2.0) -> None: self._record("restart")
+    def reconnect(self) -> None: self._record("reconnect")
     def verify_certificate_integrity(self) -> None: self._record("verify_certificate_integrity")
 
 
@@ -113,6 +114,26 @@ def test_happy_path_returns_credentials_and_emits_success():
     assert write_device_id_call[1] == b"fake-device-id"
 
 
+def test_disconnect_cleanup_failure_never_masks_original_error():
+    """The bug caught while building this: disconnecting a client that never
+    successfully connected raises RuntimeError on the real EcuUdsClient, not
+    UdsOperationError. This fake reproduces that shape (connect fails AND
+    the best-effort disconnect cleanup also raises something unrelated) to
+    prove the ORIGINAL error (ER-001) still surfaces, not the cleanup one."""
+
+    class _FailsAtConnectAndAtDisconnectCleanup(_FakeUdsClient):
+        def disconnect(self) -> None:
+            raise RuntimeError("PythonIsoTpConnection is not opened")  # mirrors the real behavior
+
+    uds = _FailsAtConnectAndAtDisconnectCleanup(fail_at="connect")
+    orch = _orchestrator(uds=uds)
+
+    with pytest.raises(ProvisioningError) as exc_info:
+        orch.run("ABC12345678901234")
+
+    assert exc_info.value.er_code == "ER-001"  # not masked by the RuntimeError from cleanup
+
+
 @pytest.mark.parametrize("fail_at,expected_er_code", [
     ("connect", "ER-001"),
     ("write_vin", "ER-002"),
@@ -122,7 +143,8 @@ def test_happy_path_returns_credentials_and_emits_success():
     ("write_device_certificate", "ER-005"),
     ("write_root_ca", "ER-005"),
     ("restart", "ER-006"),
-    ("verify_certificate_integrity", "ER-006"),
+    ("reconnect", "ER-006"),
+    ("verify_certificate_integrity", "ER-007"),
 ])
 def test_uds_failures_map_to_correct_er_code(fail_at, expected_er_code):
     uds = _FakeUdsClient(fail_at=fail_at)
@@ -181,3 +203,36 @@ def test_multiple_reporters_all_receive_events():
 
     assert len(r1.events) == len(r2.events) > 0
     assert r1.events[-1].stage == r2.events[-1].stage == ProvisioningStage.SUCCESS
+
+
+def test_reconnect_failure_never_reaches_verify():
+    """The actual claim of this change: restart -> reconnect -> verify run
+    in that order, a reconnect failure stops the sequence before verify is
+    ever attempted, and the reported error is unambiguously ER-006 — not a
+    guess between "restart/reconnect" and "verify" like before."""
+    uds = _FakeUdsClient(fail_at="reconnect")
+    orch = _orchestrator(uds=uds)
+
+    with pytest.raises(ProvisioningError) as exc_info:
+        orch.run("ABC12345678901234")
+
+    assert exc_info.value.er_code == "ER-006"
+    called = [c[0] for c in uds.calls]
+    assert "restart" in called
+    assert "reconnect" in called
+    assert "verify_certificate_integrity" not in called  # never reached
+
+
+def test_verify_failure_confirms_reconnect_already_succeeded():
+    """The mirror case: when verify fails, reconnect() has already
+    succeeded — proving the error really is isolated to verification, not a
+    disguised reconnect failure."""
+    uds = _FakeUdsClient(fail_at="verify_certificate_integrity")
+    orch = _orchestrator(uds=uds)
+
+    with pytest.raises(ProvisioningError) as exc_info:
+        orch.run("ABC12345678901234")
+
+    assert exc_info.value.er_code == "ER-007"
+    called = [c[0] for c in uds.calls]
+    assert called.index("reconnect") < called.index("verify_certificate_integrity")
