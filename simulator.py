@@ -14,13 +14,14 @@ discussed gets caught in dev instead of only on real hardware.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 
 import isotp
 from udsoncan import Response
 
-from config import AppConfig, Did, RoutineId
+from config import AppConfig, Did, RoutineId, load_config
 from uds.transport import build_isotp_stack
 
 logger = logging.getLogger(__name__)
@@ -250,3 +251,30 @@ class SimulatedEcuServer:
             raise _NegativeResponse(Response.Code.ConditionsNotCorrect)
 
         return bytes([0x71]) + payload[1:4]
+
+
+def main() -> None:
+    """Standalone entry point — runs the simulator as its own persistent
+    process, listening on whatever config.load_config(env) resolves to, so
+    main.py can be pointed at it from a separate terminal. Previously
+    SimulatedEcuServer only ever ran inside test fixtures, in a background
+    thread within the same pytest process — there was no way to start it on
+    its own for a manual trial run."""
+    from dotenv import load_dotenv  # local: only needed for the standalone runner, not when imported as a library
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    load_dotenv()
+
+    env = os.environ.get("PROVISIONING_ENV", "dev")
+    cfg = load_config(env=env)
+    stack = build_isotp_stack(cfg, role="ecu")
+    server = SimulatedEcuServer(stack)
+    print(f"Simulator listening on {cfg.can_bus.interface}:{cfg.can_bus.channel} (env={env}) — Ctrl+C to stop")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down.")
+
+
+if __name__ == "__main__":
+    main()
